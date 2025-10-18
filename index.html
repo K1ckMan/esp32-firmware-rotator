@@ -1,4 +1,3 @@
-const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -213,10 +212,10 @@ document.getElementById("btnScan").onclick = ()=>{
   holdState = false;
   document.getElementById("btnHold").classList.remove("hold-active");
   document.getElementById("statusText").innerText = scanState ? "Scan: ON" : "Standby";
-  document.getElementById("btnScan").innerText = scanState ? "Scan: ON" : "Scan";
   fetch("/scan"); 
-  logEvent("Scan "+(scanState?"ON":"OFF"));
-}
+  logEvent("Scan " + (scanState ? "ON" : "OFF"));
+};
+
 
 // Sliders
 document.getElementById("speed").oninput = (e)=>{
@@ -276,4 +275,3 @@ document.addEventListener("DOMContentLoaded",()=>{
 </script>
 </body>
 </html>
-)rawliteral";
