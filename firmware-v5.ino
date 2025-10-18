@@ -1,5 +1,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
+#include <HTTPClient.h>
+#include <Update.h>
 #include <LittleFS.h>
 #include <Preferences.h>
 #include <Wire.h>
@@ -14,9 +16,20 @@
 #define BMI160_CMD_REG 0x7E
 #define BMI160_GYRO_DATA 0x0C
 
-// --- WiFi ---
-const char* ssid = "GPOINTER";
-const char* password = "12345678";
+// --- WiFi AP ---
+const char* apSSID = "GPOINTER";
+const char* apPassword = "12345678";
+
+// --- WiFi Client (для подключения к роутеру) ---
+const char* staSSID = "COVID 2G";
+const char* staPassword = "password123";
+
+// --- Firmware Update ---
+const char* versionUrl = "http://gpointer.eu/firmware/version.json";
+const char* firmwareUrl = "http://gpointer.eu/firmware/firmware.bin";
+String currentVersion = "beta v0.2";
+String latestVersion = "";
+volatile int otaProgress = 0;
 
 WebServer server(80);
 Preferences preferences;
@@ -32,10 +45,10 @@ unsigned long lastScanTime = 0;
 
 // --- Gyro Hold режим ---
 bool holdMode = false;
-float targetYaw = 0;          // Целевое направление
-float currentYaw = 0;         // Текущее направление
+float targetYaw = 0;
+float currentYaw = 0;
 float gyroOffsetZ = 0;
-const float GYRO_SENSITIVITY = 16.384; // same as before
+const float GYRO_SENSITIVITY = 16.384;
 float holdThreshold = 5.0;
 float holdKp = 0.8;
 unsigned long lastGyroUpdate = 0;
@@ -76,7 +89,7 @@ void handleRoot() {
   f.close();
 }
 
-// ---------------- BMI160 I2C helpers (manual) ----------------
+// ---------------- BMI160 I2C helpers ----------------
 void writeBMI160(uint8_t reg, uint8_t value) {
   Wire.beginTransmission(BMI160_ADDR);
   Wire.write(reg);
@@ -174,7 +187,7 @@ void rotateStepsInterruptible(bool dir, int steps, int speed) {
   if (delay_us < 80) delay_us = 80;
 
   for (int i = 0; i < steps; i++) {
-    if (!scanning) break; // stop immediately
+    if (!scanning) break;
     digitalWrite(STEP_PIN, HIGH);
     delayMicroseconds(delay_us);
     digitalWrite(STEP_PIN, LOW);
@@ -199,6 +212,120 @@ void holdDirectionCorrection() {
     Serial.printf("Hold correction: error=%.1f°, steps=%d, dir=%s\n",
                   error, correctionSteps, dir ? "CW" : "CCW");
   }
+}
+
+// ---------------- OTA Functions ----------------
+void performOTA(const char* url) {
+  Serial.println("\n=== OTA Update Started ===");
+  
+  server.close();
+  server.stop();
+  delay(500);
+  
+  Serial.println("Services stopped, starting download...");
+
+  HTTPClient http;
+  http.begin(url);
+  http.setTimeout(30000);
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  
+  Serial.println("Connecting to server...");
+  int httpCode = http.GET();
+  Serial.printf("HTTP Response: %d\n", httpCode);
+  
+  if (httpCode != HTTP_CODE_OK) {
+    Serial.printf("Download failed, error: %s\n", http.errorToString(httpCode).c_str());
+    http.end();
+    restoreServices();
+    return;
+  }
+
+  int contentLength = http.getSize();
+  Serial.printf("Firmware size: %d bytes\n", contentLength);
+
+  if (contentLength <= 0) {
+    Serial.println("Invalid firmware size");
+    http.end();
+    restoreServices();
+    return;
+  }
+
+  bool canBegin = Update.begin(contentLength);
+  if (!canBegin) {
+    Serial.printf("Not enough space. Need: %d, Free: %d\n", 
+                  contentLength, ESP.getFreeSketchSpace());
+    Update.printError(Serial);
+    http.end();
+    restoreServices();
+    return;
+  }
+
+  Serial.println("Starting firmware download...");
+  
+  WiFiClient* stream = http.getStreamPtr();
+  size_t written = 0;
+  uint8_t buff[1024];
+  
+  unsigned long lastPrint = 0;
+  
+  while (http.connected() && (written < contentLength)) {
+    size_t available = stream->available();
+    
+    if (available) {
+      size_t bytesToRead = (available > sizeof(buff)) ? sizeof(buff) : available;
+      size_t bytesRead = stream->readBytes(buff, bytesToRead);
+      
+      size_t bytesWritten = Update.write(buff, bytesRead);
+      
+      if (bytesWritten != bytesRead) {
+        Serial.println("Write failed!");
+        Update.printError(Serial);
+        break;
+      }
+      
+      written += bytesWritten;
+      
+      if (millis() - lastPrint > 500) {
+        otaProgress = (written * 100) / contentLength;
+        Serial.printf("Progress: %d%% (%d/%d bytes)\n", 
+                      otaProgress, written, contentLength);
+        lastPrint = millis();
+      }
+    }
+    
+    delay(1);
+  }
+
+  Serial.printf("\nTotal written: %d bytes\n", written);
+
+  if (written != contentLength) {
+    Serial.printf("Download incomplete! Expected %d, got %d\n", contentLength, written);
+    Update.abort();
+    http.end();
+    restoreServices();
+    return;
+  }
+
+  if (Update.end(true)) {
+    Serial.println("\n=== OTA SUCCESS ===");
+    Serial.println("Firmware updated successfully!");
+    Serial.println("Rebooting in 3 seconds...");
+    http.end();
+    delay(3000);
+    ESP.restart();
+  } else {
+    Serial.println("\n=== OTA FAILED ===");
+    Update.printError(Serial);
+    http.end();
+    restoreServices();
+  }
+}
+
+void restoreServices() {
+  Serial.println("Restoring services...");
+  delay(500);
+  server.begin();
+  Serial.println("Services restored.");
 }
 
 // ---------------- Web Handlers ----------------
@@ -315,6 +442,124 @@ void handleGetSettings() {
   server.send(200, "application/json", json);
 }
 
+void handleStartOTA() {
+  // Проверяем подключение к WiFi
+  if (WiFi.status() != WL_CONNECTED) {
+    server.send(503, "text/html", 
+      "<html><body><h2>Error</h2>"
+      "<p>Not connected to WiFi. Cannot perform OTA update.</p>"
+      "<p>Device needs internet connection to download firmware.</p>"
+      "<a href='/'>Back</a></body></html>");
+    Serial.println("OTA failed: No WiFi connection");
+    return;
+  }
+  
+  server.send(200, "text/html", 
+    "<html><body><h2>OTA Update Started</h2>"
+    "<p>Device is downloading firmware. Please wait...</p>"
+    "<p>Check Serial Monitor for progress.</p>"
+    "<p><b>Do not disconnect power!</b></p>"
+    "</body></html>");
+  
+  // Останавливаем сканирование и hold режим
+  scanning = false;
+  holdMode = false;
+  
+  // Даём время веб-серверу завершить отправку ответа
+  delay(500);
+  
+  Serial.println("=== Starting OTA from server ===");
+  performOTA(firmwareUrl);
+}
+
+void handleOTAProgress() {
+  String json = "{\"progress\":" + String(otaProgress) + "}";
+  server.send(200, "application/json", json);
+}
+
+void handleVersion() {
+  String json = "{";
+  json += "\"current\":\"" + currentVersion + "\",";
+  json += "\"wifiConnected\":" + String(WiFi.status() == WL_CONNECTED ? "true" : "false");
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleCheckVersion() {
+  if (WiFi.status() != WL_CONNECTED) {
+    server.send(503, "application/json", "{\"error\":\"No WiFi connection\"}");
+    return;
+  }
+
+  HTTPClient http;
+  http.begin(versionUrl);
+  http.setTimeout(10000);
+  
+  int httpCode = http.GET();
+  
+  if (httpCode == 200) {
+    String payload = http.getString();
+    payload.trim();
+    Serial.println("Version JSON: " + payload);
+    
+    // Парсим и сохраняем latest version
+    int start = payload.indexOf("\"latest\":");
+    if (start >= 0) {
+      start = payload.indexOf("\"", start + 9);
+      int end = payload.indexOf("\"", start + 1);
+      if (start >= 0 && end > start) {
+        latestVersion = payload.substring(start + 1, end);
+        Serial.println("Latest version parsed: " + latestVersion);
+      }
+    }
+    
+    server.send(200, "application/json", payload);
+    Serial.println("Version check successful");
+  } else {
+    String error = "{\"error\":\"Failed to fetch version\",\"code\":" + String(httpCode) + "}";
+    server.send(500, "application/json", error);
+    Serial.printf("Version check failed: %d\n", httpCode);
+  }
+  
+  http.end();
+}
+
+// Проверка версии при загрузке (из вашего примера)
+void checkForUpdate() {
+  if (WiFi.status() != WL_CONNECTED) return;
+
+  Serial.println("Fetching version JSON...");
+  HTTPClient http;
+  http.begin(versionUrl);
+  http.setTimeout(10000);
+  
+  int httpCode = http.GET();
+  
+  if (httpCode == 200) {
+    String payload = http.getString();
+    payload.trim();
+    Serial.println("Version JSON: " + payload);
+
+    int start = payload.indexOf("\"latest\":");
+    if (start >= 0) {
+      start = payload.indexOf("\"", start + 9);
+      int end = payload.indexOf("\"", start + 1);
+      if (start >= 0 && end > start) {
+        latestVersion = payload.substring(start + 1, end);
+        Serial.println("Latest version: " + latestVersion);
+      } else {
+        Serial.println("Failed to parse version string.");
+      }
+    } else {
+      Serial.println("\"latest\" field not found in JSON.");
+    }
+  } else {
+    Serial.printf("Failed to fetch version, HTTP code: %d\n", httpCode);
+  }
+
+  http.end();
+}
+
 // ---------------- Setup ----------------
 unsigned long lastSerialDebug = 0;
 
@@ -333,8 +578,30 @@ void setup() {
   if (!LittleFS.begin()) Serial.println("LittleFS mount failed");
   else Serial.println("LittleFS mounted");
 
-  WiFi.softAP(ssid, password);
-  Serial.printf("AP started: SSID=%s, IP=%s\n", ssid, WiFi.softAPIP().toString().c_str());
+  // Запуск в Dual Mode: AP + STA
+  WiFi.mode(WIFI_AP_STA);
+  
+  // Запуск точки доступа
+  WiFi.softAP(apSSID, apPassword);
+  Serial.printf("AP started: SSID=%s, IP=%s\n", apSSID, WiFi.softAPIP().toString().c_str());
+
+  // Подключение к WiFi роутеру для OTA
+  WiFi.begin(staSSID, staPassword);
+  Serial.print("Connecting to WiFi");
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConnected to WiFi!");
+    Serial.println("IP address: " + WiFi.localIP().toString());
+    checkForUpdate(); // Проверяем версию при старте
+  } else {
+    Serial.println("\nFailed to connect to WiFi. OTA updates will not be available.");
+  }
 
   server.on("/", handleRoot);
   server.on("/speed", handleSpeed);
@@ -350,6 +617,10 @@ void setup() {
   server.on("/holdKp", handleHoldKp);
   server.on("/resetYaw", handleResetYaw);
   server.on("/getSettings", handleGetSettings);
+  server.on("/start-ota", handleStartOTA);
+  server.on("/ota-progress", handleOTAProgress);
+  server.on("/version", handleVersion);
+  server.on("/check-version", handleCheckVersion);
   server.begin();
 
   lastSerialDebug = millis();

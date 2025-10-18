@@ -13,6 +13,8 @@ body{font-family:Arial,sans-serif;margin:0;padding:0;background:#000;color:#fff;
 .btn{display:block;width:100%;margin:15px 0;padding:24px;font-size:26px;font-weight:bold;border:none;border-radius:8px;background:#444;color:#fff;}
 .btn:active{background:#666;}
 .btn.hold-active{background:#00aa00;}
+.btn.update-btn{background:#0066cc;}
+.btn.update-btn:active{background:#0088ff;}
 .row{display:flex;gap:12px;margin:20px 0;}
 .row .btn{flex:1;font-size:28px;padding:30px;}
 .slider-container{margin:20px 0;text-align:center;}
@@ -20,7 +22,11 @@ body{font-family:Arial,sans-serif;margin:0;padding:0;background:#000;color:#fff;
 input[type=range]{width:100%;}
 .status{margin-top:20px;font-size:22px;font-weight:bold;text-align:center;}
 .gyro-info{background:#111;padding:15px;margin:20px 0;border-radius:8px;font-size:18px;}
+.firmware-info{background:#111;padding:15px;margin:20px 0;border-radius:8px;font-size:18px;}
+.progress-bar{width:100%;height:30px;background:#222;border-radius:8px;overflow:hidden;margin:20px 0;}
+.progress-fill{height:100%;background:#00aa00;transition:width 0.3s;}
 .log{background:#111;padding:10px;border:1px solid #444;height:200px;overflow-y:auto;font-size:14px;}
+.warning{color:#ff6600;font-weight:bold;margin:10px 0;}
 </style>
 </head>
 <body>
@@ -86,9 +92,41 @@ input[type=range]{width:100%;}
 </div>
 
 <div id="firmware" class="tab-content">
-  <div>Current Version: <b>beta v0.3</b></div>
-  <div>New Version: <b id="newFirmwareVersion">Checking...</b></div>
-  <button class="btn" onclick="checkFirmwareVersion()">Check Update</button>
+  <h2>Firmware Update</h2>
+  
+  <div class="firmware-info">
+    <div>Current Version: <b id="currentVersion">Loading...</b></div>
+    <div>Latest Version: <b id="latestVersion">Checking...</b></div>
+    <div style="margin-top:10px;">Status: <b id="updateStatus">Ready</b></div>
+  </div>
+  
+  <button class="btn update-btn" id="btnCheckUpdate" onclick="checkFirmwareVersion()">
+    Check for Updates
+  </button>
+  
+  <button class="btn update-btn" id="btnStartUpdate" onclick="startOTAUpdate()" style="display:none;">
+    Start OTA Update
+  </button>
+  
+  <div class="progress-bar" id="progressBar" style="display:none;">
+    <div class="progress-fill" id="progressFill" style="width:0%"></div>
+  </div>
+  
+  <div id="progressText" style="text-align:center;font-size:18px;display:none;">
+    Progress: <b id="progressPercent">0%</b>
+  </div>
+  
+  <div class="warning" id="updateWarning" style="display:none;">
+    ⚠️ Do not disconnect power during update!
+  </div>
+  
+  <div style="margin-top:30px;padding:15px;background:#111;border-radius:8px;font-size:14px;color:#888;">
+    <b>Update Instructions:</b><br>
+    1. Click "Check for Updates" to see if new firmware is available<br>
+    2. If update is available, click "Start OTA Update"<br>
+    3. Wait for download and installation to complete<br>
+    4. Device will automatically reboot with new firmware
+  </div>
 </div>
 
 <div id="debug" class="tab-content">
@@ -108,6 +146,8 @@ input[type=range]{width:100%;}
 
 <script>
 let scanState=false, holdState=false;
+let otaUpdateInProgress = false;
+let progressCheckInterval = null;
 
 function openTab(evt,id){
   document.querySelectorAll('.tab-content').forEach(e=>e.classList.remove('active'));
@@ -121,7 +161,9 @@ function logEvent(t){
   l.innerHTML=`<div>[${ts}] ${t}</div>`+l.innerHTML;
 }
 
-function sendCommand(cmd){fetch(cmd).then(r=>r.text()).then(t=>logEvent(t)).catch(e=>logEvent("Error:"+e));}
+function sendCommand(cmd){
+  fetch(cmd).then(r=>r.text()).then(t=>logEvent(t)).catch(e=>logEvent("Error:"+e));
+}
 
 function holdCommand(cmd){
   sendCommand(cmd);
@@ -155,6 +197,157 @@ async function updateGyroStatus(){
   }catch(e){}
 }
 setInterval(updateGyroStatus, 200);
+
+// Load current version
+async function loadCurrentVersion(){
+  try{
+    const resp = await fetch("/version");
+    const data = await resp.json();
+    document.getElementById("currentVersion").innerText = data.current;
+    
+    // Если есть latest version в кэше ESP32, показываем её
+    if(data.latest && data.latest !== ""){
+      document.getElementById("latestVersion").innerText = data.latest;
+    }
+  }catch(e){
+    document.getElementById("currentVersion").innerText = "Unknown";
+  }
+}
+
+// Check firmware version
+async function checkFirmwareVersion(){
+  document.getElementById("latestVersion").innerText = "Checking...";
+  document.getElementById("updateStatus").innerText = "Checking for updates...";
+  document.getElementById("btnCheckUpdate").disabled = true;
+  
+  try{
+    // Проверяем подключение к WiFi
+    const versionResp = await fetch("/version");
+    const versionData = await versionResp.json();
+    
+    if(!versionData.wifiConnected){
+      document.getElementById("latestVersion").innerText = "No Internet";
+      document.getElementById("updateStatus").innerText = "Device not connected to WiFi";
+      document.getElementById("btnCheckUpdate").disabled = false;
+      document.getElementById("btnStartUpdate").style.display = "none";
+      logEvent("Cannot check updates: No WiFi connection");
+      return;
+    }
+    
+    // Получаем информацию о последней версии через ESP32
+    const resp = await fetch("/check-version");
+    
+    if(!resp.ok){
+      throw new Error("Server returned " + resp.status);
+    }
+    
+    const data = await resp.json();
+    
+    if(data.error){
+      throw new Error(data.error);
+    }
+    
+    document.getElementById("latestVersion").innerText = data.latest;
+    
+    if(data.latest !== versionData.current){
+      document.getElementById("updateStatus").innerText = "New version available: " + data.latest;
+      document.getElementById("btnStartUpdate").style.display = "block";
+      logEvent("New firmware available: " + data.latest);
+    } else {
+      document.getElementById("updateStatus").innerText = "You have the latest version";
+      document.getElementById("btnStartUpdate").style.display = "none";
+      logEvent("Firmware is up to date");
+    }
+  }catch(e){
+    document.getElementById("latestVersion").innerText = "Error";
+    document.getElementById("updateStatus").innerText = "Failed to check for updates: " + e.message;
+    document.getElementById("btnStartUpdate").style.display = "none";
+    logEvent("Firmware check error: " + e.message);
+  }
+  
+  document.getElementById("btnCheckUpdate").disabled = false;
+}
+
+// Start OTA update
+async function startOTAUpdate(){
+  if(otaUpdateInProgress){
+    alert("Update already in progress!");
+    return;
+  }
+  
+  if(!confirm("Start firmware update? Device will reboot after completion.")){
+    return;
+  }
+  
+  otaUpdateInProgress = true;
+  document.getElementById("updateStatus").innerText = "Starting update...";
+  document.getElementById("btnCheckUpdate").disabled = true;
+  document.getElementById("btnStartUpdate").disabled = true;
+  document.getElementById("progressBar").style.display = "block";
+  document.getElementById("progressText").style.display = "block";
+  document.getElementById("updateWarning").style.display = "block";
+  
+  logEvent("OTA Update started");
+  
+  try{
+    await fetch("/start-ota");
+    
+    // Start checking progress
+    progressCheckInterval = setInterval(checkOTAProgress, 500);
+    
+  }catch(e){
+    document.getElementById("updateStatus").innerText = "Failed to start update";
+    logEvent("OTA start error: " + e);
+    resetOTAUI();
+  }
+}
+
+// Check OTA progress
+async function checkOTAProgress(){
+  try{
+    const resp = await fetch("/ota-progress");
+    const data = await resp.json();
+    
+    let progress = data.progress;
+    document.getElementById("progressFill").style.width = progress + "%";
+    document.getElementById("progressPercent").innerText = progress + "%";
+    
+    if(progress > 0){
+      document.getElementById("updateStatus").innerText = "Downloading firmware...";
+    }
+    
+    if(progress >= 100){
+      document.getElementById("updateStatus").innerText = "Update complete! Rebooting...";
+      clearInterval(progressCheckInterval);
+      logEvent("OTA completed successfully, device rebooting...");
+      
+      setTimeout(()=>{
+        document.getElementById("updateStatus").innerText = "Device rebooting, please wait...";
+      }, 1000);
+      
+      setTimeout(()=>{
+        location.reload();
+      }, 10000);
+    }
+  }catch(e){
+    // Server might be down during reboot, this is expected
+  }
+}
+
+// Reset OTA UI
+function resetOTAUI(){
+  otaUpdateInProgress = false;
+  document.getElementById("btnCheckUpdate").disabled = false;
+  document.getElementById("btnStartUpdate").disabled = false;
+  document.getElementById("progressBar").style.display = "none";
+  document.getElementById("progressText").style.display = "none";
+  document.getElementById("updateWarning").style.display = "none";
+  document.getElementById("progressFill").style.width = "0%";
+  if(progressCheckInterval){
+    clearInterval(progressCheckInterval);
+    progressCheckInterval = null;
+  }
+}
 
 // Load saved settings on startup
 async function loadSavedSettings(){
@@ -216,7 +409,6 @@ document.getElementById("btnScan").onclick = ()=>{
   logEvent("Scan " + (scanState ? "ON" : "OFF"));
 };
 
-
 // Sliders
 document.getElementById("speed").oninput = (e)=>{
   document.getElementById("speedValue").innerText=e.target.value+"%";
@@ -254,21 +446,10 @@ document.getElementById("btnResetYaw").onclick = ()=>{
   logEvent("Yaw reset to 0°");
 };
 
-async function checkFirmwareVersion(){
-  try{
-    const resp = await fetch("https://gpointer.eu/firmware/version.json");
-    const data = await resp.json();
-    document.getElementById("newFirmwareVersion").innerText=data.latest;
-    logEvent("Firmware check: latest="+data.latest);
-  }catch(e){
-    document.getElementById("newFirmwareVersion").innerText="Error";
-    logEvent("Firmware check error");
-  }
-}
-
-// ✅ Вызов после загрузки страницы
+// Initialize on page load
 document.addEventListener("DOMContentLoaded",()=>{
   initButtonStates();
+  loadCurrentVersion();
   checkFirmwareVersion();
   loadSavedSettings();
 });
