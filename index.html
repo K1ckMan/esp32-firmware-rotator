@@ -1,0 +1,279 @@
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>ESP Motor + Gyro</title>
+<style>
+body{font-family:Arial,sans-serif;margin:0;padding:0;background:#000;color:#fff;-webkit-user-select:none;user-select:none;touch-action:none;}
+.tabs{display:flex;background:#111;}
+.tabs button{flex:1;padding:14px;background:#111;color:#fff;border:none;font-size:18px;}
+.tabs button.active{background:#333;}
+.tab-content{display:none;padding:20px;background:#000;min-height:80vh;}
+.tab-content.active{display:block;}
+.btn{display:block;width:100%;margin:15px 0;padding:24px;font-size:26px;font-weight:bold;border:none;border-radius:8px;background:#444;color:#fff;}
+.btn:active{background:#666;}
+.btn.hold-active{background:#00aa00;}
+.row{display:flex;gap:12px;margin:20px 0;}
+.row .btn{flex:1;font-size:28px;padding:30px;}
+.slider-container{margin:20px 0;text-align:center;}
+.slider-container label{display:block;margin-bottom:8px;font-size:20px;}
+input[type=range]{width:100%;}
+.status{margin-top:20px;font-size:22px;font-weight:bold;text-align:center;}
+.gyro-info{background:#111;padding:15px;margin:20px 0;border-radius:8px;font-size:18px;}
+.log{background:#111;padding:10px;border:1px solid #444;height:200px;overflow-y:auto;font-size:14px;}
+</style>
+</head>
+<body>
+
+<div class="tabs">
+  <button class="tablink active" onclick="openTab(event,'remote')">Remote</button>
+  <button class="tablink" onclick="openTab(event,'gyro')">Gyro</button>
+  <button class="tablink" onclick="openTab(event,'firmware')">Firmware</button>
+  <button class="tablink" onclick="openTab(event,'debug')">Debug</button>
+</div>
+
+<div id="remote" class="tab-content active">
+  <div class="row">
+    <button class="btn" id="btnLeft">Left</button>
+    <button class="btn" id="btnRight">Right</button>
+  </div>
+  
+  <button class="btn" id="btnHold">Hold Direction</button>
+  <button class="btn" id="btnScan">Scan</button>
+  
+  <div class="slider-container">
+    <label>Speed: <span id="speedValue">50%</span></label>
+    <input type="range" id="speed" min="0" max="100" value="50">
+  </div>
+  <div class="slider-container">
+    <label>Move Range: <span id="moveValue">200</span></label>
+    <input type="range" id="moveRange" min="1" max="2000" value="200">
+  </div>
+  <div class="slider-container">
+    <label>Scan Range: <span id="scanValue">10</span></label>
+    <input type="range" id="scanRange" min="1" max="3000" value="10">
+  </div>
+  <div class="slider-container">
+    <label>Scan Delay: <span id="delayValue">1.0</span></label>
+    <input type="range" id="delayRange" min="0" max="5" step="0.1" value="1.0">
+  </div>
+  
+  <div class="status" id="statusText">Standby</div>
+</div>
+
+<div id="gyro" class="tab-content">
+  <h2>Gyroscope Settings</h2>
+  <div class="gyro-info">
+    <div>Current Yaw: <b id="gyroCurrentYaw">0.0</b></div>
+    <div>Target Yaw: <b id="gyroTargetYaw">0.0</b></div>
+    <div>Error: <b id="gyroYawError">0.0</b></div>
+    <div>Status: <b id="gyroStatus">Standby</b></div>
+  </div>
+  
+  <div class="slider-container">
+    <label>Hold Threshold: <span id="thresholdValue">5.0</span></label>
+    <input type="range" id="threshold" min="0.5" max="20" step="0.5" value="5.0">
+    <small style="color:#888;">Minimum deviation to trigger correction</small>
+  </div>
+  
+  <div class="slider-container">
+    <label>Hold Correction Power (Kp): <span id="kpValue">0.80</span></label>
+    <input type="range" id="kp" min="0.1" max="5.0" step="0.1" value="0.8">
+    <small style="color:#888;">Strength of direction correction</small>
+  </div>
+  
+  <button class="btn" id="btnResetYaw">Reset Yaw to 0</button>
+</div>
+
+<div id="firmware" class="tab-content">
+  <div>Current Version: <b>beta v0.3</b></div>
+  <div>New Version: <b id="newFirmwareVersion">Checking...</b></div>
+  <button class="btn" onclick="checkFirmwareVersion()">Check Update</button>
+</div>
+
+<div id="debug" class="tab-content">
+  <h3>Events Log</h3>
+  <div class="log" id="eventLog"></div>
+  
+  <h3 style="margin-top:30px;">Gyroscope Data</h3>
+  <div class="gyro-info">
+    <div>Current Yaw: <b id="debugYaw">0.0</b></div>
+    <div>Target Yaw: <b id="debugTarget">0.0</b></div>
+    <div>Error: <b id="debugError">0.0</b></div>
+    <div>Threshold: <b id="debugThreshold">5.0</b></div>
+    <div>Kp: <b id="debugKp">0.80</b></div>
+    <div>Hold Active: <b id="debugHold">No</b></div>
+  </div>
+</div>
+
+<script>
+let scanState=false, holdState=false;
+
+function openTab(evt,id){
+  document.querySelectorAll('.tab-content').forEach(e=>e.classList.remove('active'));
+  document.querySelectorAll('.tablink').forEach(e=>e.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+  evt.currentTarget.classList.add('active');
+}
+
+function logEvent(t){
+  let l=document.getElementById("eventLog"), ts=new Date().toLocaleTimeString();
+  l.innerHTML=`<div>[${ts}] ${t}</div>`+l.innerHTML;
+}
+
+function sendCommand(cmd){fetch(cmd).then(r=>r.text()).then(t=>logEvent(t)).catch(e=>logEvent("Error:"+e));}
+
+function holdCommand(cmd){
+  sendCommand(cmd);
+  let holdInterval=setInterval(()=>sendCommand(cmd),100);
+  const clearHold=()=>clearInterval(holdInterval);
+  document.addEventListener("mouseup",clearHold,{once:true});
+  document.addEventListener("touchend",clearHold,{once:true});
+}
+
+// Gyro status update
+async function updateGyroStatus(){
+  try{
+    const resp = await fetch("/gyro");
+    const data = await resp.json();
+    
+    let error = data.target - data.yaw;
+    while(error > 180) error -= 360;
+    while(error < -180) error += 360;
+    
+    document.getElementById("gyroCurrentYaw").innerText = data.yaw.toFixed(1);
+    document.getElementById("gyroTargetYaw").innerText = data.target.toFixed(1);
+    document.getElementById("gyroYawError").innerText = error.toFixed(1);
+    document.getElementById("gyroStatus").innerText = data.hold ? "HOLDING" : "Standby";
+    
+    document.getElementById("debugYaw").innerText = data.yaw.toFixed(1);
+    document.getElementById("debugTarget").innerText = data.target.toFixed(1);
+    document.getElementById("debugError").innerText = error.toFixed(1);
+    document.getElementById("debugThreshold").innerText = data.threshold.toFixed(1);
+    document.getElementById("debugKp").innerText = data.kp.toFixed(2);
+    document.getElementById("debugHold").innerText = data.hold ? "Yes" : "No";
+  }catch(e){}
+}
+setInterval(updateGyroStatus, 200);
+
+// Load saved settings on startup
+async function loadSavedSettings(){
+  try{
+    const resp = await fetch("/getSettings");
+    const data = await resp.json();
+    document.getElementById("speed").value = data.speed;
+    document.getElementById("speedValue").innerText = data.speed+"%";
+    document.getElementById("moveRange").value = data.moveSteps;
+    document.getElementById("moveValue").innerText = data.moveSteps;
+    document.getElementById("scanRange").value = data.scanSteps;
+    document.getElementById("scanValue").innerText = data.scanSteps;
+    document.getElementById("delayRange").value = data.scanDelay;
+    document.getElementById("delayValue").innerText = data.scanDelay;
+    document.getElementById("threshold").value = data.threshold;
+    document.getElementById("thresholdValue").innerText = data.threshold;
+    document.getElementById("kp").value = data.kp;
+    document.getElementById("kpValue").innerText = data.kp.toFixed(2);
+  }catch(e){}
+}
+
+// Buttons
+document.getElementById("btnLeft").addEventListener("mousedown",()=>holdCommand("/left"));
+document.getElementById("btnLeft").addEventListener("touchstart",()=>holdCommand("/left"));
+document.getElementById("btnRight").addEventListener("mousedown",()=>holdCommand("/right"));
+document.getElementById("btnRight").addEventListener("touchstart",()=>holdCommand("/right"));
+
+// Init button states
+async function initButtonStates(){
+  try{
+    const gyroResp = await fetch("/gyro");
+    const gyroData = await gyroResp.json();
+    holdState = gyroData.hold;
+    scanState = false;
+    document.getElementById("btnHold").classList.toggle("hold-active", holdState);
+    document.getElementById("statusText").innerText = holdState ? "Hold: ON" : "Standby";
+    document.getElementById("btnScan").innerText = scanState ? "Scan: ON" : "Scan";
+  }catch(e){ console.log("Init buttons error", e);}
+}
+
+// Hold button
+document.getElementById("btnHold").onclick = ()=>{
+  holdState = !holdState;
+  scanState = false;
+  document.getElementById("btnHold").classList.toggle("hold-active", holdState);
+  document.getElementById("btnScan").innerText = "Scan";
+  document.getElementById("statusText").innerText = holdState ? "Hold: ON" : "Standby";
+  fetch("/hold"); 
+  logEvent("Hold "+(holdState?"ON":"OFF"));
+}
+
+// Scan button
+document.getElementById("btnScan").onclick = ()=>{
+  scanState = !scanState;
+  holdState = false;
+  document.getElementById("btnHold").classList.remove("hold-active");
+  document.getElementById("statusText").innerText = scanState ? "Scan: ON" : "Standby";
+  document.getElementById("btnScan").innerText = scanState ? "Scan: ON" : "Scan";
+  fetch("/scan"); 
+  logEvent("Scan "+(scanState?"ON":"OFF"));
+}
+
+// Sliders
+document.getElementById("speed").oninput = (e)=>{
+  document.getElementById("speedValue").innerText=e.target.value+"%";
+  fetch("/speed?value="+e.target.value);
+  logEvent("Speed "+e.target.value+"%");
+};
+document.getElementById("moveRange").oninput = (e)=>{
+  document.getElementById("moveValue").innerText=e.target.value;
+  fetch("/moveSteps?value="+e.target.value);
+  logEvent("Move "+e.target.value);
+};
+document.getElementById("scanRange").oninput = (e)=>{
+  document.getElementById("scanValue").innerText=e.target.value;
+  fetch("/scanSteps?value="+e.target.value);
+  logEvent("ScanRange "+e.target.value);
+};
+document.getElementById("delayRange").oninput = (e)=>{
+  document.getElementById("delayValue").innerText=e.target.value;
+  fetch("/scanDelay?value="+e.target.value);
+  logEvent("ScanDelay "+e.target.value+"s");
+};
+
+document.getElementById("threshold").oninput = (e)=>{
+  document.getElementById("thresholdValue").innerText=e.target.value+"°";
+  fetch("/holdThreshold?value="+e.target.value);
+  logEvent("Threshold "+e.target.value+"°");
+};
+document.getElementById("kp").oninput = (e)=>{
+  document.getElementById("kpValue").innerText=parseFloat(e.target.value).toFixed(2);
+  fetch("/holdKp?value="+e.target.value);
+  logEvent("Kp "+e.target.value);
+};
+document.getElementById("btnResetYaw").onclick = ()=>{
+  fetch("/resetYaw");
+  logEvent("Yaw reset to 0°");
+};
+
+async function checkFirmwareVersion(){
+  try{
+    const resp = await fetch("https://gpointer.eu/firmware/version.json");
+    const data = await resp.json();
+    document.getElementById("newFirmwareVersion").innerText=data.latest;
+    logEvent("Firmware check: latest="+data.latest);
+  }catch(e){
+    document.getElementById("newFirmwareVersion").innerText="Error";
+    logEvent("Firmware check error");
+  }
+}
+
+// ✅ Вызов после загрузки страницы
+document.addEventListener("DOMContentLoaded",()=>{
+  initButtonStates();
+  checkFirmwareVersion();
+  loadSavedSettings();
+});
+</script>
+</body>
+</html>
+)rawliteral";
